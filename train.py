@@ -10,6 +10,99 @@ from tqdm import tqdm
 import json
 import matplotlib.pyplot as plt
 
+# 改进的流场损失函数
+import torch.nn.functional as F
+
+class FlowFieldLoss(nn.Module):
+    """
+    精简版物理信息损失函数（仅包含涡量约束）
+    包含：
+    - 基础数据损失（MSE/MAE，分量加权）
+    - 速度大小损失
+    - 涡量约束（增强旋涡结构捕捉）
+    """
+    def __init__(self,
+                 weight_u=1.1,                     # u分量权重
+                 weight_v=1.0,                     # v分量权重
+                 weight_w=1.0,                     # w分量权重（若为3D）
+                 use_mae=False,                    # 是否使用MAE（否则MSE）
+                 use_velocity_magnitude=False,      # 是否启用速度大小损失
+                 weight_vorticity=0.1,             # 涡量约束权重
+                 dx=1.0, dy=1.0):                  # 网格间距（需根据实际设置）
+        super().__init__()
+        self.weight_u = weight_u
+        self.weight_v = weight_v
+        self.weight_w = weight_w
+        self.use_mae = use_mae
+        self.use_velocity_magnitude = use_velocity_magnitude
+        self.weight_vorticity = weight_vorticity
+        self.dx = dx
+        self.dy = dy
+
+    def forward(self, pred, target):
+        # 数据损失
+        if self.use_mae:
+            data_loss = F.l1_loss(pred, target)
+        else:
+            data_loss = F.mse_loss(pred, target)
+
+        n_channels = pred.shape[1]
+        if n_channels >= 2 and (self.weight_u != 1.0 or self.weight_v != 1.0 or (n_channels>2 and self.weight_w != 1.0)):
+            weights_list = [self.weight_u, self.weight_v]
+            if n_channels > 2:
+                weights_list.append(self.weight_w)
+            weights = torch.tensor(weights_list, device=pred.device).view(1, n_channels, 1, 1)
+            component_loss = F.mse_loss(pred * weights, target * weights)
+            data_loss = 0.7 * data_loss + 0.3 * component_loss
+
+        if self.use_velocity_magnitude:
+            pred_mag = torch.sqrt(torch.sum(pred**2, dim=1, keepdim=True) + 1e-8)
+            target_mag = torch.sqrt(torch.sum(target**2, dim=1, keepdim=True) + 1e-8)
+            mag_loss = F.mse_loss(pred_mag, target_mag)
+            data_loss = 0.7 * data_loss + 0.3 * mag_loss
+
+        # 涡量约束（使用填充导数，保持尺寸）
+        u = pred[:, 0:1, ...]
+        v = pred[:, 1:2, ...]
+        vorticity_loss = 0.0
+        if self.weight_vorticity > 0:
+            # 计算涡量分量
+            dv_dx = self._derivative(v, axis=2, delta=self.dx, use_padding=True)
+            du_dy = self._derivative(u, axis=3, delta=self.dy, use_padding=True)
+            vorticity = dv_dx - du_dy
+            dvort_dx = self._derivative(vorticity, axis=2, delta=self.dx, use_padding=True)
+            dvort_dy = self._derivative(vorticity, axis=3, delta=self.dy, use_padding=True)
+            vorticity_loss = torch.mean(dvort_dx**2 + dvort_dy**2)
+
+        total_loss = data_loss + self.weight_vorticity * vorticity_loss
+        return total_loss
+
+    def _derivative(self, tensor, axis, delta=1.0, use_padding=False):
+        """计算中心差分导数。若use_padding=True，返回与输入相同尺寸；否则尺寸减2。"""
+        if use_padding:
+            if axis == 2:  # x方向（高度维度）
+                padded = F.pad(tensor, (0, 0, 1, 1), mode='replicate')
+                return (padded[:, :, 2:, :] - padded[:, :, :-2, :]) / (2 * delta)
+            elif axis == 3:  # y方向（宽度维度）
+                padded = F.pad(tensor, (1, 1, 0, 0), mode='replicate')
+                return (padded[:, :, :, 2:] - padded[:, :, :, :-2]) / (2 * delta)
+            elif axis == 4:  # z方向（3D流场）
+                padded = F.pad(tensor, (0, 0, 0, 0, 1, 1), mode='replicate')
+                return (padded[:, :, :, :, 2:] - padded[:, :, :, :, :-2]) / (2 * delta)
+            else:
+                raise ValueError("Axis must be 2,3,4")
+        else:
+            if axis == 2:
+                return (tensor[:, :, 2:, :] - tensor[:, :, :-2, :]) / (2 * delta)
+            elif axis == 3:
+                return (tensor[:, :, :, 2:] - tensor[:, :, :, :-2]) / (2 * delta)
+            elif axis == 4:
+                return (tensor[:, :, :, :, 2:] - tensor[:, :, :, :, :-2]) / (2 * delta)
+            else:
+                raise ValueError("Axis must be 2,3,4")
+
+
+
 from data_loader import get_data_loaders, DataNormalizer
 from models.unet_model import get_unet_model
 from models.gan_model import get_gan_models
@@ -39,20 +132,42 @@ class Trainer:
     def setup_model(self): # 损失函数定义
         if self.model_type == 'unet':
             self.model = get_unet_model().to(self.device)
-            self.criterion = nn.MSELoss()
+            # 使用改进的流场损失函数
+            self.criterion = FlowFieldLoss(
+                weight_u=1.1, 
+                weight_v=1.0,
+                weight_w=1.0,  # w分量权重更高
+                use_mae=False,
+                use_velocity_magnitude=True
+            )
         elif self.model_type == 'gan':
             self.generator, self.discriminator = get_gan_models()
             self.generator = self.generator.to(self.device)
             self.discriminator = self.discriminator.to(self.device)
             self.criterion_gan = nn.BCELoss()
-            self.criterion_pixel = nn.MSELoss()
+            # GAN的像素损失也使用改进的流场损失
+            self.criterion_pixel = FlowFieldLoss(
+                weight_u=1.1, 
+                weight_v=1.0,
+                weight_w=1.0,
+                use_mae=False,
+                use_velocity_magnitude=True
+            )
         elif self.model_type == 'transformer':
             self.model = get_transformer_model().to(self.device)
-            self.criterion = nn.MSELoss()
+            # Transformer也使用改进的流场损失函数
+            self.criterion = FlowFieldLoss(
+                weight_u=1.1, 
+                weight_v=1.0,
+                weight_w=1.0,
+                use_mae=False,
+                use_velocity_magnitude=True
+            )
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
         
         print(f"Model {self.model_type} initialized on {self.device}")
+        print(f"Using FlowFieldLoss with weight_u={1.1}, velocity_magnitude_loss=True")
     
     def setup_data(self):
         self.train_loader, self.val_loader, self.test_loader, self.normalizer = get_data_loaders(
@@ -359,10 +474,10 @@ class Trainer:
 
 def main():
     parser = argparse.ArgumentParser(description='Train flow field prediction models')
-    parser.add_argument('--model', type=str, default='unet', choices=['unet', 'gan', 'transformer'],
+    parser.add_argument('--model', type=str, default='transformer', choices=['unet', 'gan', 'transformer'],
                        help='Model type to train')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')
-    parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=200, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--num_workers', type=int, default=0, help='Number of data loading workers')
     parser.add_argument('--save_interval', type=int, default=10, help='Save checkpoint every N epochs')
